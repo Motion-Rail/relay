@@ -18,6 +18,7 @@ Set LIVE_TONE=1 to actually call EXFO; otherwise tones are simulated.
 
 import os
 import re
+import asyncio
 import json
 import time
 import uuid
@@ -326,8 +327,26 @@ async def tone(body: ToneIn, x_app_key: str | None = Header(default=None),
         url = TOPO_HOST.rstrip("/") + url
 
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    # The RTU has ONE test source: a second ad-hoc test while one is scheduled returns
+    # 409 AdhocTestAlreadyScheduled. Wait for the previous test to clear, then retry.
+    attempts = int(os.getenv("TONE_RETRIES", "3"))
+    delay = float(os.getenv("TONE_RETRY_DELAY", "1.5"))
+    last = None
     async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.request(TONE_METHOD, url, headers=headers, content=outer)
-    if not (200 <= r.status_code < 300):
-        raise HTTPException(502, f"EXFO tone call failed ({r.status_code}): {r.text[:200]}")
-    return {"ok": True, "status": r.status_code, "route_id": route_id, "detail": r.text[:300]}
+        for i in range(attempts):
+            r = await c.request(TONE_METHOD, url, headers=headers, content=outer)
+            if 200 <= r.status_code < 300:
+                return {"ok": True, "status": r.status_code, "route_id": route_id,
+                        "retries": i, "detail": r.text[:300]}
+            last = r
+            if r.status_code == 409:
+                await asyncio.sleep(delay)
+                continue
+            break
+
+    if last is not None and last.status_code == 409:
+        raise HTTPException(409, "RTU busy — an ad-hoc test is already scheduled. "
+                                 "Wait for the current tone to finish, or clear the pending "
+                                 "test in FMS, then try again.")
+    raise HTTPException(502, f"EXFO tone call failed ({last.status_code}): {last.text[:200]}")
