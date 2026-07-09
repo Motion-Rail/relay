@@ -2,26 +2,17 @@ services:
   - type: web
     name: tone-tester-relay
     runtime: python
-    plan: starter            # small always-on; avoids cold-start on first tone
+    plan: free
+    pythonVersion: "3.12.7"
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
-      - key: EXFO_USERNAME     # optional service account (usually leave unset; app logs in per-user)
-        sync: false
-      - key: EXFO_PASSWORD
-        sync: false
-      - key: APP_KEY           # shared key the field app must send (recommended)
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+      - key: APP_KEY
         generateValue: true
-      - key: APP_ORIGIN        # set to your app's URL in production, e.g. https://tone.example.com
+      - key: APP_ORIGIN
         value: "*"
-      - key: LIVE_TONE         # "1" once resolution is captured and you're ready to hit EXFO
+      - key: LIVE_TONE
         value: "0"
-      - key: TOPO_HOST         # confirm the host in front of /api/topology/...
-        sync: false
-      - key: RESOLVE_URL       # set once you capture the FMS route-search request
-        sync: false
-      - key: RESOLVE_ID_FIELD
-        value: "id"
-      - key: RESOLVE_NAME_FIELD
-        value: "name"
