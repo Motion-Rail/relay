@@ -71,7 +71,7 @@ SEARCH_QUERY = (
     "$orderBy: OpticalRouteSearchOutputsOrderBy!, $first: Int!, $offset: Int!) { "
     "routeSearchResult: searchOpticalRouteByRtu(matchType: CONTAINS, search: $search, condition: $condition, "
     "orderBy: $orderBy, first: $first, offset: $offset) { totalCount nodes { id name rtuId rtuName portId portLabel "
-    "rtu { serialNumber model site { id name __typename } __typename } "
+    "rtu { serialNumber model attachStatus site { id name __typename } __typename } "
     "testSetup { id name __typename } __typename } __typename } }"
 )
 
@@ -149,8 +149,17 @@ async def _graphql_search(token, search, first, offset):
 
 def _node_site(n):
     rtu = n.get("rtu") or {}
-    site = (rtu.get("site") or {}).get("name") or ""
-    return site
+    return (rtu.get("site") or {}).get("name") or ""
+
+def _node_rtu_meta(n):
+    rtu = n.get("rtu") or {}
+    status = str(rtu.get("attachStatus") or "").upper()
+    return {
+        "attachStatus": status,
+        "online": status in ("ATTACHED", "ONLINE", "CONNECTED"),
+        "serial": rtu.get("serialNumber") or "",
+        "model": rtu.get("model") or "",
+    }
 
 def _cache_node(n):
     """Store a node under RTUID|NAME so the same cable seen from both ends stays distinct."""
@@ -158,11 +167,15 @@ def _cache_node(n):
     rtu_id = str(n.get("rtuId", "") or "")
     if not name:
         return None
+    meta = _node_rtu_meta(n)
     entry = {"id": str(n.get("id", "")), "rtuId": rtu_id,
-             "rtuName": str(n.get("rtuName", "") or ""), "site": _node_site(n)}
+             "rtuName": str(n.get("rtuName", "") or ""), "site": _node_site(n),
+             "attachStatus": meta["attachStatus"], "online": meta["online"],
+             "serial": meta["serial"], "model": meta["model"]}
     ROUTE_ID_CACHE[f"{rtu_id}|{name}"] = entry
     if rtu_id:
-        RTU_INDEX[rtu_id] = {"rtuName": entry["rtuName"], "site": entry["site"]}
+        RTU_INDEX[rtu_id] = {"rtuName": entry["rtuName"], "site": entry["site"],
+                             "attachStatus": entry["attachStatus"], "online": entry["online"]}
     return entry
 
 
@@ -224,6 +237,7 @@ class ToneIn(BaseModel):
     durationS: int = 10
     freqHz: int = 1000
     routeId: str | None = None
+    force: bool = False
 
 
 # ── endpoints ───────────────────────────────────────────────────────────────────
@@ -261,12 +275,17 @@ async def routes(body: PrimeIn, x_app_key: str | None = Header(default=None),
             continue
         rtu_id = str(n.get("rtuId", "") or "")
         key = (_stem(name), rtu_id)
+        meta = _node_rtu_meta(n)
         g = groups.setdefault(key, {"stem": _stem(name), "rtuId": rtu_id,
                                     "rtuName": str(n.get("rtuName", "") or ""),
-                                    "site": _node_site(n), "fibres": 0})
+                                    "site": _node_site(n),
+                                    "attachStatus": meta["attachStatus"],
+                                    "online": meta["online"],
+                                    "serial": meta["serial"], "model": meta["model"],
+                                    "fibres": 0})
         g["fibres"] += 1
 
-    out = sorted(groups.values(), key=lambda g: (g["stem"], g["site"], g["rtuName"]))
+    out = sorted(groups.values(), key=lambda g: (not g["online"], g["stem"], g["site"], g["rtuName"]))
     return {"ok": True, "totalCount": total, "cables": out}
 
 
@@ -290,6 +309,13 @@ async def tone(body: ToneIn, x_app_key: str | None = Header(default=None),
                           f"{body.durationS}s {body.freqHz}Hz"}
 
     token = await _valid_token(x_session)
+
+    # Guard: an offline/detached RTU cannot emit. Fail loudly rather than silently.
+    meta = RTU_INDEX.get(str(body.rtuId or ""), {})
+    if meta and not meta.get("online", True) and not body.force:
+        raise HTTPException(409, f"RTU {meta.get('rtuName') or body.rtuId} is "
+                                 f"{meta.get('attachStatus') or 'OFFLINE'} — it cannot emit a tone")
+
     route_id = body.routeId or await _resolve_route_id(token, body.fibre, body.rtuId)
 
     inner = _fill(MEAS_PAYLOAD_TEMPLATE,
