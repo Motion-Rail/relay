@@ -62,14 +62,16 @@ app.add_middleware(
 )
 
 SESSIONS: dict[str, dict] = {}          # session_id -> {access, refresh, exp, user}
-ROUTE_ID_CACHE: dict[str, dict] = {}    # FIBRE NAME (upper) -> {"id":..., "rtuId":...}
+ROUTE_ID_CACHE: dict[str, dict] = {}    # "RTUID|FIBRENAME" -> {"id","rtuId","rtuName","site"}
+RTU_INDEX: dict[str, dict] = {}         # rtuId -> {"rtuName","site"}
 
 # GraphQL query (compact; requests only the fields we map)
 SEARCH_QUERY = (
     "query searchOpticalRouteByRtu($search: String, $condition: OpticalRouteSearchOutputCondition, "
     "$orderBy: OpticalRouteSearchOutputsOrderBy!, $first: Int!, $offset: Int!) { "
     "routeSearchResult: searchOpticalRouteByRtu(matchType: CONTAINS, search: $search, condition: $condition, "
-    "orderBy: $orderBy, first: $first, offset: $offset) { totalCount nodes { id name rtuId portId "
+    "orderBy: $orderBy, first: $first, offset: $offset) { totalCount nodes { id name rtuId rtuName portId portLabel "
+    "rtu { serialNumber model site { id name __typename } __typename } "
     "testSetup { id name __typename } __typename } __typename } }"
 )
 
@@ -145,33 +147,59 @@ async def _graphql_search(token, search, first, offset):
     res = (data.get("data") or {}).get("routeSearchResult") or {}
     return res.get("totalCount", 0), res.get("nodes", []) or []
 
-async def _prime(token, search, max_pages=20):
-    offset, total, primed = 0, None, 0
+def _node_site(n):
+    rtu = n.get("rtu") or {}
+    site = (rtu.get("site") or {}).get("name") or ""
+    return site
+
+def _cache_node(n):
+    """Store a node under RTUID|NAME so the same cable seen from both ends stays distinct."""
+    name = str(n.get("name", "")).upper()
+    rtu_id = str(n.get("rtuId", "") or "")
+    if not name:
+        return None
+    entry = {"id": str(n.get("id", "")), "rtuId": rtu_id,
+             "rtuName": str(n.get("rtuName", "") or ""), "site": _node_site(n)}
+    ROUTE_ID_CACHE[f"{rtu_id}|{name}"] = entry
+    if rtu_id:
+        RTU_INDEX[rtu_id] = {"rtuName": entry["rtuName"], "site": entry["site"]}
+    return entry
+
+
+async def _crawl(token, search, max_pages=20):
+    """Page through a search, caching every node. Returns (nodes, totalCount)."""
+    offset, total, all_nodes = 0, None, []
     while True:
         tc, nodes = await _graphql_search(token, search, PAGE_SIZE, offset)
         if total is None:
             total = tc
         for n in nodes:
-            name = str(n.get("name", "")).upper()
-            if name:
-                ROUTE_ID_CACHE[name] = {"id": str(n.get("id", "")), "rtuId": str(n.get("rtuId", ""))}
-                primed += 1
+            _cache_node(n)
+        all_nodes.extend(nodes)
         offset += PAGE_SIZE
         if not nodes or offset >= (total or 0) or offset >= PAGE_SIZE * max_pages:
             break
-    return primed, total
+    return all_nodes, total
 
-async def _resolve_route_id(token, fibre):
-    key = fibre.upper()
+
+async def _prime(token, search, rtu_id=None, max_pages=20):
+    nodes, total = await _crawl(token, search, max_pages)
+    if rtu_id:
+        nodes = [n for n in nodes if str(n.get("rtuId", "")) == str(rtu_id)]
+    return len(nodes), total
+
+
+async def _resolve_route_id(token, fibre, rtu_id):
+    """Resolve a fibre name to its OpticalRouteID for a SPECIFIC RTU."""
+    if not rtu_id:
+        raise HTTPException(400, "rtuId is required — the same cable exists at both ends")
+    key = f"{rtu_id}|{fibre.upper()}"
     if key not in ROUTE_ID_CACHE:
-        await _prime(token, _stem(fibre))          # prime the whole cable from the stem
+        await _crawl(token, _stem(fibre))          # prime the whole cable
     if key not in ROUTE_ID_CACHE:
-        _, nodes = await _graphql_search(token, fibre, PAGE_SIZE, 0)  # fall back to exact search
-        for n in nodes:
-            if str(n.get("name", "")).upper() == key:
-                ROUTE_ID_CACHE[key] = {"id": str(n.get("id", "")), "rtuId": str(n.get("rtuId", ""))}
+        await _crawl(token, fibre)                 # fall back to exact name
     if key not in ROUTE_ID_CACHE:
-        raise HTTPException(404, f"No OpticalRouteID found for {fibre}")
+        raise HTTPException(404, f"No OpticalRouteID for {fibre} on RTU {rtu_id}")
     entry = ROUTE_ID_CACHE[key]
     rid = entry.get(TONE_ID_FIELD) or entry.get("id")
     if not rid:
@@ -186,10 +214,12 @@ class LoginIn(BaseModel):
 
 class PrimeIn(BaseModel):
     search: str
+    rtuId: str | None = None
 
 class ToneIn(BaseModel):
     fibre: str
     stem: str | None = None
+    rtuId: str | None = None          # which end we are toning FROM
     wavelengthNm: int = 1550
     durationS: int = 10
     freqHz: int = 1000
@@ -201,7 +231,7 @@ class ToneIn(BaseModel):
 async def health():
     return {"ok": True, "auth_host": AUTH_BASE, "topo_host": TOPO_HOST,
             "graphql": GRAPHQL_URL, "tone": "live" if LIVE_TONE else "simulated",
-            "tone_id_field": TONE_ID_FIELD, "cached": len(ROUTE_ID_CACHE), "client": CLIENT_ID}
+            "tone_id_field": TONE_ID_FIELD, "cached": len(ROUTE_ID_CACHE), "rtus": len(RTU_INDEX), "client": CLIENT_ID}
 
 @app.post("/api/login")
 async def login(body: LoginIn, x_app_key: str | None = Header(default=None)):
@@ -211,13 +241,43 @@ async def login(body: LoginIn, x_app_key: str | None = Header(default=None)):
     _store(sid, tok, body.username)
     return {"session_id": sid, "user": body.username}
 
+@app.post("/api/routes")
+async def routes(body: PrimeIn, x_app_key: str | None = Header(default=None),
+                 x_session: str | None = Header(default=None)):
+    """Search FMS and return one entry per CABLE-AT-AN-RTU.
+
+    The same cable (e.g. F-RGAC-SNBC-A-R432) is visible from both end RTUs, so the
+    stem alone is ambiguous. Each result therefore carries the RTU that would emit
+    the tone — that is the thing the engineer actually picks.
+    """
+    _check_key(x_app_key)
+    token = await _valid_token(x_session)
+    nodes, total = await _crawl(token, body.search)
+
+    groups: dict[tuple, dict] = {}
+    for n in nodes:
+        name = str(n.get("name", "")).upper()
+        if not name:
+            continue
+        rtu_id = str(n.get("rtuId", "") or "")
+        key = (_stem(name), rtu_id)
+        g = groups.setdefault(key, {"stem": _stem(name), "rtuId": rtu_id,
+                                    "rtuName": str(n.get("rtuName", "") or ""),
+                                    "site": _node_site(n), "fibres": 0})
+        g["fibres"] += 1
+
+    out = sorted(groups.values(), key=lambda g: (g["stem"], g["site"], g["rtuName"]))
+    return {"ok": True, "totalCount": total, "cables": out}
+
+
 @app.post("/api/prime")
 async def prime(body: PrimeIn, x_app_key: str | None = Header(default=None),
                 x_session: str | None = Header(default=None)):
     _check_key(x_app_key)
     token = await _valid_token(x_session)
-    primed, total = await _prime(token, body.search)
-    return {"ok": True, "primed": primed, "totalCount": total}
+    primed, total = await _prime(token, body.search, body.rtuId)
+    return {"ok": True, "primed": primed, "totalCount": total, "rtuId": body.rtuId}
+
 
 @app.post("/api/tone")
 async def tone(body: ToneIn, x_app_key: str | None = Header(default=None),
@@ -230,7 +290,7 @@ async def tone(body: ToneIn, x_app_key: str | None = Header(default=None),
                           f"{body.durationS}s {body.freqHz}Hz"}
 
     token = await _valid_token(x_session)
-    route_id = body.routeId or await _resolve_route_id(token, body.fibre)
+    route_id = body.routeId or await _resolve_route_id(token, body.fibre, body.rtuId)
 
     inner = _fill(MEAS_PAYLOAD_TEMPLATE,
                   freq=body.freqHz, duration=body.durationS, wl_m=_wl_metres(body.wavelengthNm))
